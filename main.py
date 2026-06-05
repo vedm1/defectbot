@@ -174,7 +174,7 @@ A copy of the result also lands in the UAT Defects Teams channel.</p>
     <input type=\"text\" name=\"environment\" placeholder=\"Chrome 124 on Windows 11\">
   </label>
 
-  <label>Screenshots <span class=\"hint\">(PNG / JPG, up to {MAX_MB}MB each, max {MAX_N} files)</span>
+  <label>Screenshots <span class=\"hint\">(PNG / JPG, up to {MAX_FILE_BYTES // (1024 * 1024)}MB each, max {MAX_FILES} files)</span>
     <input type=\"file\" name=\"screenshots\" multiple accept=\"image/*\">
   </label>
 
@@ -184,7 +184,7 @@ A copy of the result also lands in the UAT Defects Teams channel.</p>
 
   <button type=\"submit\">Submit defect</button>
 </form>
-</div></div></body></html>""".replace("{MAX_MB}", str(MAX_FILE_BYTES // (1024 * 1024))).replace("{MAX_N}", str(MAX_FILES))
+</div></div></body></html>"""
 
 
 @app.get("/submit", response_class=HTMLResponse)
