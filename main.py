@@ -20,7 +20,20 @@ import logging
 import os
 import re
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
+from fastapi import (
+    BackgroundTasks,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+)
+from fastapi.responses import HTMLResponse
+
+MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB per uploaded screenshot
+MAX_FILES = 6
 
 from ado_client import health_check as ado_health
 from claude_client import triage_defect
@@ -58,6 +71,264 @@ async def readyz() -> dict:
         return {"status": "ready", "ado": info}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"ADO unreachable: {e}")
+
+
+# ----------------------------------------------------------------------------
+# Web form (alternative submission UI alongside the @DefectBot Teams flow)
+# ----------------------------------------------------------------------------
+_FORM_CSS = """
+* { box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+       background: #f3f3f6; color: #1e1e1e; margin: 0; padding: 40px 16px; }
+.wrap { max-width: 720px; margin: 0 auto; }
+.card { background: #fff; padding: 32px; border-radius: 12px;
+        box-shadow: 0 1px 3px rgba(0,0,0,.06), 0 8px 24px rgba(0,0,0,.04); }
+h1 { margin: 0 0 8px; font-size: 22px; font-weight: 600; }
+.sub { color: #555; margin: 0 0 28px; font-size: 14px; }
+label { display: block; margin-top: 18px; font-size: 13px; font-weight: 600;
+        color: #333; }
+.hint { font-weight: 400; color: #777; font-size: 12px; }
+input[type=text], input[type=email], input[type=url], textarea, select {
+        width: 100%; padding: 9px 11px; margin-top: 6px; font-size: 14px;
+        border: 1px solid #d4d4d8; border-radius: 6px; background: #fff;
+        font-family: inherit; }
+textarea { min-height: 88px; resize: vertical; }
+input:focus, textarea:focus, select:focus { outline: 2px solid #6264a7;
+        outline-offset: -1px; border-color: #6264a7; }
+button { margin-top: 28px; padding: 11px 28px; background: #6264a7;
+        color: #fff; border: 0; border-radius: 6px; font-size: 14px;
+        font-weight: 600; cursor: pointer; }
+button:hover { background: #5258a0; }
+button:disabled { background: #aaa; cursor: not-allowed; }
+.banner { padding: 16px 20px; border-radius: 8px; margin-bottom: 24px;
+        font-size: 14px; line-height: 1.5; }
+.banner.ok { background: #ecfdf3; border: 1px solid #b2efc2; color: #15532b; }
+.banner.err { background: #fef2f2; border: 1px solid #fecaca; color: #7b1d1d; }
+.banner a { color: inherit; font-weight: 600; }
+.row { display: flex; gap: 16px; }
+.row > label { flex: 1; }
+"""
+
+
+def _form_html(banner: str = "") -> str:
+    """Render the defect submission form. `banner` is optional pre-rendered HTML."""
+    return f"""<!doctype html><html lang=\"en\"><head>
+<meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
+<title>Report a UAT Defect</title><style>{_FORM_CSS}</style></head>
+<body><div class=\"wrap\"><div class=\"card\">
+{banner}
+<h1>Report a UAT Defect</h1>
+<p class=\"sub\">The agent triages your report against open Bugs in <b>North Star</b>,
+classifies it, and files under Epic #375255 — NSUI | MVP Defects (Iteration <code>North Star\\PI4</code>).
+A copy of the result also lands in the UAT Defects Teams channel.</p>
+
+<form method=\"post\" action=\"/submit\" enctype=\"multipart/form-data\">
+  <div class=\"row\">
+    <label>Reporter name
+      <input type=\"text\" name=\"reporter_name\" required placeholder=\"Your name\">
+    </label>
+    <label>Reporter email <span class=\"hint\">(optional)</span>
+      <input type=\"email\" name=\"reporter_email\" placeholder=\"you@euromonitor.com\">
+    </label>
+  </div>
+
+  <label>Title
+    <input type=\"text\" name=\"title\" required maxlength=\"160\"
+           placeholder=\"Short summary, e.g. Excel export fails on Market Sizes for large filters\">
+  </label>
+
+  <label>Steps to reproduce
+    <textarea name=\"steps\" required placeholder=\"1. ...\n2. ...\n3. ...\"></textarea>
+  </label>
+
+  <div class=\"row\">
+    <label>Expected
+      <textarea name=\"expected\" required placeholder=\"What should have happened\"></textarea>
+    </label>
+    <label>Actual
+      <textarea name=\"actual\" required placeholder=\"What happened, including errors\"></textarea>
+    </label>
+  </div>
+
+  <div class=\"row\">
+    <label>Severity
+      <select name=\"severity\">
+        <option value=\"1 - Critical\">1 - Critical</option>
+        <option value=\"2 - High\">2 - High</option>
+        <option value=\"3 - Medium\" selected>3 - Medium</option>
+        <option value=\"4 - Low\">4 - Low</option>
+      </select>
+    </label>
+    <label>Module
+      <select name=\"module\">
+        <option>NSUI</option>
+        <option>Hydra Platform</option>
+        <option>Hydra Ingestion</option>
+        <option>Auth</option>
+        <option>Other</option>
+      </select>
+    </label>
+  </div>
+
+  <label>Environment <span class=\"hint\">(browser + OS)</span>
+    <input type=\"text\" name=\"environment\" placeholder=\"Chrome 124 on Windows 11\">
+  </label>
+
+  <label>Screenshots <span class=\"hint\">(PNG / JPG, up to {MAX_MB}MB each, max {MAX_N} files)</span>
+    <input type=\"file\" name=\"screenshots\" multiple accept=\"image/*\">
+  </label>
+
+  <label>Screenshot link <span class=\"hint\">(OneDrive or SharePoint share URL, view-only — optional, in addition to or instead of direct upload)</span>
+    <input type=\"url\" name=\"screenshot_url\" placeholder=\"https://euromonitor.sharepoint.com/...\">
+  </label>
+
+  <button type=\"submit\">Submit defect</button>
+</form>
+</div></div></body></html>""".replace("{MAX_MB}", str(MAX_FILE_BYTES // (1024 * 1024))).replace("{MAX_N}", str(MAX_FILES))
+
+
+@app.get("/submit", response_class=HTMLResponse)
+async def submit_form() -> HTMLResponse:
+    """Serve the defect submission form."""
+    return HTMLResponse(_form_html())
+
+
+@app.post("/submit", response_class=HTMLResponse)
+async def submit_handle(
+    reporter_name: str = Form(...),
+    reporter_email: str = Form(""),
+    title: str = Form(...),
+    steps: str = Form(...),
+    expected: str = Form(...),
+    actual: str = Form(...),
+    severity: str = Form("3 - Medium"),
+    module: str = Form(""),
+    environment: str = Form(""),
+    screenshot_url: str = Form(""),
+    screenshots: list[UploadFile] = File(default_factory=list),
+) -> HTMLResponse:
+    """Handle the form POST. Run triage, post to Teams, re-render with a result banner."""
+    # 1. Compose a single text string for Claude — same shape as a
+    #    structured @DefectBot message.
+    text_parts = [f"Title: {title}", "", "Steps to reproduce:", steps.strip(), ""]
+    text_parts += [f"Expected: {expected.strip()}", f"Actual: {actual.strip()}", ""]
+    text_parts += [
+        f"Severity: {severity}",
+        f"Module: {module}" if module else "",
+        f"Environment: {environment}" if environment else "",
+        f"Screenshot: {screenshot_url}" if screenshot_url else "",
+    ]
+    text = "\n".join(p for p in text_parts if p is not None).strip()
+
+    # 2. Read uploaded screenshots into the {name, url, content} shape
+    #    triage_defect already understands.
+    attachments: list[dict] = []
+    skipped: list[str] = []
+    for upload in (screenshots or [])[:MAX_FILES]:
+        if not upload or not upload.filename:
+            continue
+        try:
+            content = await upload.read()
+        except Exception:
+            log.exception("Could not read uploaded file | name=%s", upload.filename)
+            skipped.append(f"{upload.filename} (read error)")
+            continue
+        if not content:
+            continue
+        if len(content) > MAX_FILE_BYTES:
+            log.warning(
+                "Skipping oversized attachment | name=%s | bytes=%d",
+                upload.filename, len(content),
+            )
+            skipped.append(f"{upload.filename} (>{MAX_FILE_BYTES // (1024*1024)}MB)")
+            continue
+        attachments.append(
+            {"name": upload.filename, "url": "", "content": content}
+        )
+
+    log.info(
+        "form-submit start | reporter=%s | text_len=%d | attachments=%d",
+        reporter_name, len(text), len(attachments),
+    )
+
+    try:
+        result = triage_defect(
+            user_text=text,
+            reporter_name=reporter_name,
+            reporter_email=reporter_email,
+            attachments=attachments,
+        )
+        log.info(
+            "form-submit success | bug=%s | related=%s | attached=%d",
+            result.get("bugId"), result.get("relatedBugId"), len(attachments),
+        )
+        # Best-effort Teams notification (same as Outgoing Webhook path)
+        try:
+            post_to_channel(_format_success(result))
+        except Exception:
+            log.exception("Form result: failed to post to Teams (continuing)")
+
+        banner = _success_banner_html(result, len(attachments), skipped)
+    except Exception as e:
+        log.exception("form-submit failed")
+        banner = (
+            f'<div class="banner err"><b>Submission failed.</b> '
+            f'{_escape(str(e))[:300]}</div>'
+        )
+
+    return HTMLResponse(_form_html(banner))
+
+
+def _success_banner_html(
+    result: dict,
+    attached_count: int = 0,
+    skipped: list[str] | None = None,
+) -> str:
+    org = os.environ.get("ADO_ORG", "euromonitor")
+    project = "North%20Star"
+    bug_id = result.get("bugId")
+    bug_url = f"https://dev.azure.com/{org}/{project}/_workitems/edit/{bug_id}"
+    severity = _escape(result.get("severity", ""))
+    category = _escape(result.get("category", ""))
+
+    related_html = ""
+    if result.get("relatedBugId"):
+        r_id = result["relatedBugId"]
+        r_url = f"https://dev.azure.com/{org}/{project}/_workitems/edit/{r_id}"
+        related_html = (
+            f' &middot; <b>Related to:</b> <a href="{r_url}" target="_blank">#{r_id}</a>'
+        )
+
+    attach_html = ""
+    if attached_count > 0:
+        plural = "s" if attached_count != 1 else ""
+        attach_html = f' &middot; <b>{attached_count} screenshot{plural} attached</b>'
+
+    skipped_html = ""
+    if skipped:
+        items = ", ".join(_escape(s) for s in skipped)
+        skipped_html = (
+            f'<div style="margin-top:6px;font-size:12px;color:#7b5e1d">'
+            f'Skipped: {items}</div>'
+        )
+
+    return (
+        f'<div class="banner ok"><b>Logged {severity} {category} bug:</b> '
+        f'<a href="{bug_url}" target="_blank">#{bug_id}</a>'
+        f'{related_html}{attach_html}{skipped_html}</div>'
+    )
+
+
+def _escape(s: str) -> str:
+    """Minimal HTML-escape for safe-by-default rendering of user-supplied text."""
+    return (
+        (s or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
 
 
 # ----------------------------------------------------------------------------
