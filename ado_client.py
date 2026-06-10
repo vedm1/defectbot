@@ -130,31 +130,43 @@ def list_features(force_refresh: bool = False) -> list[dict]:
         _features_cache.update({"ts": now, "data": []})
         return []
 
-    ids = ",".join(str(w["id"]) for w in items[:200])
+    # ADO's batch GET endpoint caps at 200 IDs per call. Paginate through
+    # all items in chunks so we don't silently drop Features past index 200.
+    BATCH = 200
     fields = "System.Id,System.Title,System.State,System.AreaPath"
-    r = requests.get(
-        f"{API}/workitems?ids={ids}&fields={fields}&api-version=7.1",
-        headers=_headers(),
-        timeout=10,
-    )
-    r.raise_for_status()
-
     out: list[dict] = []
-    for w in r.json().get("value", []):
-        f = w.get("fields", {})
-        fid = f.get("System.Id")
-        title = f.get("System.Title", "") or ""
-        if fid and title:
-            out.append(
-                {
-                    "id": int(fid),
-                    "title": title,
-                    "state": f.get("System.State", "") or "",
-                    "areaPath": f.get("System.AreaPath", "") or "",
-                }
-            )
+    for start in range(0, len(items), BATCH):
+        chunk = items[start : start + BATCH]
+        ids = ",".join(str(w["id"]) for w in chunk)
+        r = requests.get(
+            f"{API}/workitems?ids={ids}&fields={fields}&api-version=7.1",
+            headers=_headers(),
+            timeout=20,
+        )
+        r.raise_for_status()
+        for w in r.json().get("value", []):
+            f = w.get("fields", {})
+            fid = f.get("System.Id")
+            title = f.get("System.Title", "") or ""
+            if fid and title:
+                out.append(
+                    {
+                        "id": int(fid),
+                        "title": title,
+                        "state": f.get("System.State", "") or "",
+                        "areaPath": f.get("System.AreaPath", "") or "",
+                    }
+                )
+
+    # WIQL ordered by title, but batches may have interleaved. Re-sort to keep
+    # the dropdown alphabetised.
+    out.sort(key=lambda x: x["title"].lower())
 
     _features_cache.update({"ts": now, "data": out})
+    logging.info(
+        "list_features cached %d Features (across %d batch GET pages)",
+        len(out), (len(items) + BATCH - 1) // BATCH,
+    )
     return out
 
 
