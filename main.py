@@ -35,6 +35,17 @@ from fastapi.responses import HTMLResponse
 MAX_FILE_BYTES = 10 * 1024 * 1024  # 10 MB per uploaded screenshot
 MAX_FILES = 6
 
+
+def _load_form_tags() -> list[str]:
+    """Tag options shown in the submission form.
+
+    Configured via WEB_FORM_TAGS env var (comma-separated). Default keeps the
+    two initial tags from the PoC. To add more later: set the env var in
+    Railway → Variables, no code change needed.
+    """
+    raw = os.environ.get("WEB_FORM_TAGS", "Bug_AlphaUAT1,Enhancement")
+    return [t.strip() for t in raw.split(",") if t.strip()]
+
 from ado_client import health_check as ado_health
 from claude_client import triage_defect
 from teams_client import post_to_channel
@@ -107,7 +118,26 @@ button:disabled { background: #aaa; cursor: not-allowed; }
 .banner a { color: inherit; font-weight: 600; }
 .row { display: flex; gap: 16px; }
 .row > label { flex: 1; }
+.tags-grid { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.tag-chip { display: inline-flex; align-items: center; gap: 6px;
+    padding: 7px 13px; border: 1px solid #d4d4d8; border-radius: 16px;
+    background: #fff; font-size: 13px; font-weight: 500; color: #333;
+    margin-top: 0; cursor: pointer; user-select: none;
+    transition: background .12s, border-color .12s; }
+.tag-chip:hover { background: #f7f7fa; }
+.tag-chip input { width: auto; margin: 0; accent-color: #6264a7; }
+.tag-chip:has(input:checked) { background: #ecf0fb; border-color: #6264a7;
+    color: #3d3f8a; }
 """
+
+
+def _render_tag_chips() -> str:
+    """Render the configured tag list as a chip-style checkbox group."""
+    chips = "\n    ".join(
+        f'<label class="tag-chip"><input type="checkbox" name="tags" value="{_escape(t)}"> {_escape(t)}</label>'
+        for t in _load_form_tags()
+    ) or '<span class="hint">No tags configured. Set WEB_FORM_TAGS in Railway → Variables.</span>'
+    return chips
 
 
 def _form_html(banner: str = "") -> str:
@@ -174,6 +204,11 @@ A copy of the result also lands in the UAT Defects Teams channel.</p>
     <input type=\"text\" name=\"environment\" placeholder=\"Chrome 124 on Windows 11\">
   </label>
 
+  <label>Tags <span class=\"hint\">(select all that apply)</span></label>
+  <div class=\"tags-grid\">
+    {_render_tag_chips()}
+  </div>
+
   <label>Screenshots <span class=\"hint\">(PNG / JPG, up to {MAX_FILE_BYTES // (1024 * 1024)}MB each, max {MAX_FILES} files)</span>
     <input type=\"file\" name=\"screenshots\" multiple accept=\"image/*\">
   </label>
@@ -206,6 +241,7 @@ async def submit_handle(
     environment: str = Form(""),
     screenshot_url: str = Form(""),
     screenshots: list[UploadFile] = File(default_factory=list),
+    tags: list[str] = Form(default_factory=list),
 ) -> HTMLResponse:
     """Handle the form POST. Run triage, post to Teams, re-render with a result banner."""
     # 1. Compose a single text string for Claude — same shape as a
@@ -251,16 +287,27 @@ async def submit_handle(
         reporter_name, len(text), len(attachments),
     )
 
+    # Only pass tags that are still in the configured allow-list (defence
+    # against tampered form posts).
+    allowed = set(_load_form_tags())
+    safe_tags = [t for t in (tags or []) if t in allowed]
+
+    log.info(
+        "form-submit tags | requested=%s | accepted=%s", tags, safe_tags,
+    )
+
     try:
         result = triage_defect(
             user_text=text,
             reporter_name=reporter_name,
             reporter_email=reporter_email,
             attachments=attachments,
+            extra_tags=safe_tags,
         )
         log.info(
-            "form-submit success | bug=%s | related=%s | attached=%d",
-            result.get("bugId"), result.get("relatedBugId"), len(attachments),
+            "form-submit success | bug=%s | related=%s | attached=%d | tags=%s",
+            result.get("bugId"), result.get("relatedBugId"),
+            len(attachments), safe_tags,
         )
         # Best-effort Teams notification (same as Outgoing Webhook path)
         try:

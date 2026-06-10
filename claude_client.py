@@ -80,17 +80,23 @@ def triage_defect(
     reporter_name: str,
     reporter_email: str,
     attachments: list[dict] | None = None,
+    extra_tags: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     End-to-end triage. Returns a summary dict used by the Teams reply formatter.
 
-    `attachments` is a list of {name, url} dicts pulled from the Teams payload.
-    They're appended to the ticket's Repro Steps as a clickable list — Claude
-    doesn't need to reason about them.
+    `attachments` is a list of {name, url, content} dicts. Bytes get uploaded
+    to ADO as AttachedFile relations; URL-only items are linked in Repro Steps.
+
+    `extra_tags` is an optional list of explicit tags from the submission form
+    (e.g. ['Bug_AlphaUAT1']). These get merged with Claude's auto-tags
+    (`uat-defect`, the cluster tag) before the Bug is created. Case-insensitive
+    de-dupe so we never write the same tag twice.
 
     Side effect: creates a Bug in ADO with all required links.
     """
     attachments = attachments or []
+    extra_tags = extra_tags or []
     candidates = search_recent_bugs(days=60, top=50)
     candidates_block = "\n".join(
         f"[#{c['id']}] {c['title']} | Area: {c['areaPath']} | "
@@ -124,6 +130,20 @@ def triage_defect(
 
     triage = _safe_parse_json(raw)
     triage = _normalise(triage)
+
+    # Merge in any explicit form-selected tags. ADO uses "; " as the separator.
+    if extra_tags:
+        existing_lower = {
+            t.strip().lower()
+            for t in (triage.get("tags") or "").split(";")
+            if t.strip()
+        }
+        additions = [t for t in extra_tags if t.strip().lower() not in existing_lower]
+        if additions:
+            current = (triage.get("tags") or "").strip()
+            triage["tags"] = (
+                current + "; " + "; ".join(additions) if current else "; ".join(additions)
+            )
 
     # Handle Teams attachments: prefer uploading to ADO; fall back to URL
     # passthrough for any whose bytes we couldn't fetch (auth-protected URLs).
