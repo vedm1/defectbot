@@ -128,6 +128,19 @@ button:disabled { background: #aaa; cursor: not-allowed; }
 .tag-chip input { width: auto; margin: 0; accent-color: #6264a7; }
 .tag-chip:has(input:checked) { background: #ecf0fb; border-color: #6264a7;
     color: #3d3f8a; }
+.combobox { position: relative; margin-top: 6px; }
+.combobox input[type=text] { margin-top: 0; }
+.combobox-list { position: absolute; top: calc(100% + 2px); left: 0; right: 0;
+    background: #fff; border: 1px solid #d4d4d8; border-radius: 6px;
+    margin: 0; padding: 4px 0; list-style: none; max-height: 280px;
+    overflow-y: auto; display: none; z-index: 10;
+    box-shadow: 0 6px 20px rgba(0,0,0,.08); }
+.combobox-list li { padding: 8px 12px; cursor: pointer; font-size: 14px;
+    line-height: 1.4; color: #333; }
+.combobox-list li:hover, .combobox-list li.active {
+    background: #ecf0fb; color: #3d3f8a; }
+.combobox-list li.no-results { color: #999; cursor: default;
+    padding: 14px; text-align: center; font-style: italic; }
 """
 
 
@@ -149,27 +162,144 @@ def _render_tag_chips() -> str:
     return "\n    ".join(parts)
 
 
-def _render_feature_options() -> str:
-    """Build <option> tags for the Feature dropdown from a fresh ADO query."""
+def _features_data_json() -> str:
+    """Serialize features as JSON for the client-side combobox filter."""
     try:
         features = list_features()
-    except Exception as e:
+    except Exception:
         log.exception("list_features failed")
-        return (
-            '<option value="">-- Could not load Features from ADO --</option>'
-            f'<!-- error: {_escape(str(e))[:200]} -->'
-        )
-    if not features:
-        return '<option value="">-- No Features found in North Star --</option>'
-    parts = ['<option value="">-- Select a feature --</option>']
+        return "[]"
+    items = []
     for f in features:
-        title = _escape(f["title"])
-        state = _escape(f.get("state") or "")
+        state = f.get("state") or ""
         suffix = f" ({state})" if state else ""
-        parts.append(
-            f'<option value="{f["id"]}">{f["id"]}: {title}{suffix}</option>'
-        )
-    return "\n      ".join(parts)
+        items.append({"id": f["id"], "title": f"{f['id']}: {f['title']}{suffix}"})
+    return json.dumps(items)
+
+
+def _render_feature_combobox() -> str:
+    """Render the searchable Feature combobox (input + hidden ID + result list)."""
+    try:
+        n_features = len(list_features())
+    except Exception:
+        n_features = 0
+    placeholder = (
+        f"Type to search {n_features} Features..." if n_features
+        else "Could not load Features from ADO — refresh in a few seconds"
+    )
+    return (
+        '<div class="combobox" id="feature-combobox">'
+        f'<input type="text" id="feature-search" placeholder="{placeholder}" '
+        'autocomplete="off" required>'
+        '<input type="hidden" name="feature_id" id="feature-id">'
+        '<ul class="combobox-list" id="feature-list" role="listbox"></ul>'
+        '</div>'
+    )
+
+
+# Vanilla JS combobox: filter on input, keyboard nav (Up/Down/Enter/Esc),
+# click to select, click-outside to close. Kept outside the f-string so the
+# JS braces don't conflict with Python format syntax.
+_FORM_JS = r"""
+(function() {
+  const features = window.FEATURES || [];
+  const wrap = document.getElementById('feature-combobox');
+  if (!wrap) return;
+  const input = wrap.querySelector('#feature-search');
+  const hidden = wrap.querySelector('#feature-id');
+  const list = wrap.querySelector('#feature-list');
+  let active = -1;
+
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function(c) {
+      return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];
+    });
+  }
+
+  function render(filter) {
+    const q = (filter || '').toLowerCase().trim();
+    const matches = q === '' ? features : features.filter(function(f) {
+      return f.title.toLowerCase().includes(q);
+    });
+    if (matches.length === 0) {
+      list.innerHTML = '<li class="no-results">No matching Features</li>';
+    } else {
+      list.innerHTML = matches.slice(0, 100).map(function(f) {
+        return '<li role="option" data-id="' + f.id + '">' + esc(f.title) + '</li>';
+      }).join('');
+    }
+    list.style.display = 'block';
+    active = -1;
+  }
+
+  function selectItem(li) {
+    if (!li || li.classList.contains('no-results')) return;
+    input.value = li.textContent;
+    hidden.value = li.dataset.id;
+    list.style.display = 'none';
+  }
+
+  input.addEventListener('focus', function() { render(input.value); });
+  input.addEventListener('input', function() {
+    hidden.value = '';
+    render(input.value);
+  });
+
+  input.addEventListener('keydown', function(e) {
+    const items = list.querySelectorAll('li[data-id]');
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (list.style.display === 'none') render(input.value);
+      active = Math.min(items.length - 1, active + 1);
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      active = Math.max(0, active - 1);
+    } else if (e.key === 'Enter') {
+      if (active >= 0 && items[active]) {
+        e.preventDefault();
+        selectItem(items[active]);
+        return;
+      }
+    } else if (e.key === 'Escape') {
+      list.style.display = 'none';
+      return;
+    } else {
+      return;
+    }
+    items.forEach(function(li, i) { li.classList.toggle('active', i === active); });
+    if (active >= 0 && items[active]) {
+      items[active].scrollIntoView({block: 'nearest'});
+    }
+  });
+
+  list.addEventListener('click', function(e) {
+    const li = e.target.closest('li');
+    selectItem(li);
+  });
+
+  document.addEventListener('click', function(e) {
+    if (!wrap.contains(e.target)) list.style.display = 'none';
+  });
+
+  // Guard the form submission: don't allow submit if a Feature wasn't picked.
+  const form = wrap.closest('form');
+  if (form) {
+    form.addEventListener('submit', function(e) {
+      if (!hidden.value) {
+        e.preventDefault();
+        input.focus();
+        input.setCustomValidity('Pick a Feature from the dropdown.');
+        input.reportValidity();
+      } else {
+        input.setCustomValidity('');
+      }
+    });
+    input.addEventListener('input', function() {
+      input.setCustomValidity('');
+    });
+  }
+})();
+"""
 
 
 def _form_html(banner: str = "") -> str:
@@ -232,11 +362,8 @@ A copy of the result also lands in the UAT Defects Teams channel.</p>
     </label>
   </div>
 
-  <label>Feature <span class=\"hint\">(required — the bug will be linked to this Feature in ADO)</span>
-    <select name=\"feature_id\" required>
-      {_render_feature_options()}
-    </select>
-  </label>
+  <label>Feature <span class=\"hint\">(required — type to search, the bug will be linked to this Feature in ADO)</span></label>
+  {_render_feature_combobox()}
 
   <label>Environment <span class=\"hint\">(browser + OS)</span>
     <input type=\"text\" name=\"environment\" placeholder=\"Chrome 124 on Windows 11\">
@@ -257,7 +384,10 @@ A copy of the result also lands in the UAT Defects Teams channel.</p>
 
   <button type=\"submit\">Submit defect</button>
 </form>
-</div></div></body></html>"""
+</div></div>
+<script>window.FEATURES = {_features_data_json()};</script>
+<script>{_FORM_JS}</script>
+</body></html>"""
 
 
 @app.get("/submit", response_class=HTMLResponse)
