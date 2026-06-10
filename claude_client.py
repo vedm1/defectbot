@@ -81,6 +81,7 @@ def triage_defect(
     reporter_email: str,
     attachments: list[dict] | None = None,
     extra_tags: list[str] | None = None,
+    feature_id: int | None = None,
 ) -> dict[str, Any]:
     """
     End-to-end triage. Returns a summary dict used by the Teams reply formatter.
@@ -185,6 +186,7 @@ def triage_defect(
         related_bug_id=triage.get("relatedBugId"),
         related_comment=triage.get("relationReason", ""),
         attached_file_urls=uploaded,
+        related_feature_id=feature_id,
     )
 
     return {

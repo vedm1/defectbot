@@ -46,7 +46,7 @@ def _load_form_tags() -> list[str]:
     raw = os.environ.get("WEB_FORM_TAGS", "Bug_AlphaUAT1,Enhancement")
     return [t.strip() for t in raw.split(",") if t.strip()]
 
-from ado_client import health_check as ado_health
+from ado_client import health_check as ado_health, list_features
 from claude_client import triage_defect
 from teams_client import post_to_channel
 
@@ -132,12 +132,44 @@ button:disabled { background: #aaa; cursor: not-allowed; }
 
 
 def _render_tag_chips() -> str:
-    """Render the configured tag list as a chip-style checkbox group."""
-    chips = "\n    ".join(
-        f'<label class="tag-chip"><input type="checkbox" name="tags" value="{_escape(t)}"> {_escape(t)}</label>'
-        for t in _load_form_tags()
-    ) or '<span class="hint">No tags configured. Set WEB_FORM_TAGS in Railway → Variables.</span>'
-    return chips
+    """Render the configured tag list as a chip-style checkbox group.
+
+    The first tag in the list is checked by default.
+    """
+    tags = _load_form_tags()
+    if not tags:
+        return '<span class="hint">No tags configured. Set WEB_FORM_TAGS in Railway → Variables.</span>'
+    parts = []
+    for idx, t in enumerate(tags):
+        checked = " checked" if idx == 0 else ""
+        parts.append(
+            f'<label class="tag-chip"><input type="checkbox" name="tags" '
+            f'value="{_escape(t)}"{checked}> {_escape(t)}</label>'
+        )
+    return "\n    ".join(parts)
+
+
+def _render_feature_options() -> str:
+    """Build <option> tags for the Feature dropdown from a fresh ADO query."""
+    try:
+        features = list_features()
+    except Exception as e:
+        log.exception("list_features failed")
+        return (
+            '<option value="">-- Could not load Features from ADO --</option>'
+            f'<!-- error: {_escape(str(e))[:200]} -->'
+        )
+    if not features:
+        return '<option value="">-- No Features found in North Star --</option>'
+    parts = ['<option value="">-- Select a feature --</option>']
+    for f in features:
+        title = _escape(f["title"])
+        state = _escape(f.get("state") or "")
+        suffix = f" ({state})" if state else ""
+        parts.append(
+            f'<option value="{f["id"]}">{f["id"]}: {title}{suffix}</option>'
+        )
+    return "\n      ".join(parts)
 
 
 def _form_html(banner: str = "") -> str:
@@ -200,6 +232,12 @@ A copy of the result also lands in the UAT Defects Teams channel.</p>
     </label>
   </div>
 
+  <label>Feature <span class=\"hint\">(required — the bug will be linked to this Feature in ADO)</span>
+    <select name=\"feature_id\" required>
+      {_render_feature_options()}
+    </select>
+  </label>
+
   <label>Environment <span class=\"hint\">(browser + OS)</span>
     <input type=\"text\" name=\"environment\" placeholder=\"Chrome 124 on Windows 11\">
   </label>
@@ -242,6 +280,7 @@ async def submit_handle(
     screenshot_url: str = Form(""),
     screenshots: list[UploadFile] = File(default_factory=list),
     tags: list[str] = Form(default_factory=list),
+    feature_id: str = Form(...),
 ) -> HTMLResponse:
     """Handle the form POST. Run triage, post to Teams, re-render with a result banner."""
     # 1. Compose a single text string for Claude — same shape as a
@@ -292,8 +331,24 @@ async def submit_handle(
     allowed = set(_load_form_tags())
     safe_tags = [t for t in (tags or []) if t in allowed]
 
+    # Validate feature_id is a real Feature in the current cached list.
+    feature_int: int | None = None
+    try:
+        feature_int = int(feature_id)
+    except (TypeError, ValueError):
+        feature_int = None
+    feature_ids = {f["id"] for f in list_features()}
+    if feature_int not in feature_ids:
+        banner = (
+            '<div class="banner err"><b>Invalid Feature.</b> '
+            'The Feature you selected wasn\'t found in North Star. '
+            'Refresh the page to load the latest list and try again.</div>'
+        )
+        return HTMLResponse(_form_html(banner))
+
     log.info(
-        "form-submit tags | requested=%s | accepted=%s", tags, safe_tags,
+        "form-submit tags | requested=%s | accepted=%s | feature=%d",
+        tags, safe_tags, feature_int,
     )
 
     try:
@@ -303,11 +358,12 @@ async def submit_handle(
             reporter_email=reporter_email,
             attachments=attachments,
             extra_tags=safe_tags,
+            feature_id=feature_int,
         )
         log.info(
-            "form-submit success | bug=%s | related=%s | attached=%d | tags=%s",
+            "form-submit success | bug=%s | related=%s | feature=%d | attached=%d | tags=%s",
             result.get("bugId"), result.get("relatedBugId"),
-            len(attachments), safe_tags,
+            feature_int, len(attachments), safe_tags,
         )
         # Best-effort Teams notification (same as Outgoing Webhook path)
         try:

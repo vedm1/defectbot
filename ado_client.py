@@ -10,6 +10,7 @@ Three operations the function needs:
 import base64
 import logging
 import os
+import time
 from typing import Optional
 
 import requests
@@ -92,6 +93,71 @@ def search_recent_bugs(days: int = 60, top: int = 50) -> list[dict]:
     return out
 
 
+# In-memory TTL cache so we don't WIQL on every form load.
+_features_cache: dict = {"ts": 0.0, "data": []}
+FEATURES_CACHE_TTL = 300  # seconds
+
+
+def list_features(force_refresh: bool = False) -> list[dict]:
+    """Return all non-Removed Features in the configured project.
+
+    Cached for FEATURES_CACHE_TTL seconds so the /submit page doesn't pay the
+    WIQL + batch-fetch cost on every render. Each item is
+    {id, title, state, areaPath}.
+    """
+    now = time.time()
+    if not force_refresh and (now - _features_cache["ts"]) < FEATURES_CACHE_TTL:
+        return _features_cache["data"]
+
+    wiql = {
+        "query": (
+            "SELECT [System.Id] FROM WorkItems "
+            f"WHERE [System.TeamProject] = '{PROJECT}' "
+            "AND [System.WorkItemType] = 'Feature' "
+            "AND [System.State] <> 'Removed' "
+            "ORDER BY [System.Title]"
+        )
+    }
+    r = requests.post(
+        f"{API}/wiql?api-version=7.1",
+        headers={**_headers(), "Content-Type": "application/json"},
+        json=wiql,
+        timeout=10,
+    )
+    r.raise_for_status()
+    items = r.json().get("workItems", [])
+    if not items:
+        _features_cache.update({"ts": now, "data": []})
+        return []
+
+    ids = ",".join(str(w["id"]) for w in items[:200])
+    fields = "System.Id,System.Title,System.State,System.AreaPath"
+    r = requests.get(
+        f"{API}/workitems?ids={ids}&fields={fields}&api-version=7.1",
+        headers=_headers(),
+        timeout=10,
+    )
+    r.raise_for_status()
+
+    out: list[dict] = []
+    for w in r.json().get("value", []):
+        f = w.get("fields", {})
+        fid = f.get("System.Id")
+        title = f.get("System.Title", "") or ""
+        if fid and title:
+            out.append(
+                {
+                    "id": int(fid),
+                    "title": title,
+                    "state": f.get("System.State", "") or "",
+                    "areaPath": f.get("System.AreaPath", "") or "",
+                }
+            )
+
+    _features_cache.update({"ts": now, "data": out})
+    return out
+
+
 def upload_attachment(file_name: str, content: bytes) -> str:
     """Upload binary content to ADO's attachments endpoint.
 
@@ -127,6 +193,7 @@ def create_bug_with_links(
     related_bug_id: Optional[int] = None,
     related_comment: str = "",
     attached_file_urls: Optional[list[dict]] = None,
+    related_feature_id: Optional[int] = None,
 ) -> int:
     """
     Create a Bug with all fields and links in one request.
@@ -195,6 +262,21 @@ def create_bug_with_links(
                     "url": att["url"],
                     "attributes": {
                         "comment": f"Uploaded from Teams: {att.get('name', 'attachment')}"
+                    },
+                },
+            }
+        )
+
+    if related_feature_id:
+        patch.append(
+            {
+                "op": "add",
+                "path": "/relations/-",
+                "value": {
+                    "rel": "System.LinkTypes.Related",
+                    "url": f"{ORG_API}/workItems/{int(related_feature_id)}",
+                    "attributes": {
+                        "comment": "Auto-linked to the Feature picked at submission time."
                     },
                 },
             }
