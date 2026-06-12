@@ -204,15 +204,31 @@ def list_uat_defects(force_refresh: bool = False) -> list[dict]:
     if not force_refresh and (now - _defects_cache["ts"]) < DEFECTS_CACHE_TTL:
         return _defects_cache["data"]
 
+    # Tag allow-list for the board. Defaults pull both agent-tagged defects
+    # (`uat-defect`) and the form-applied `Bug_AlphaUAT1`. Override the env var
+    # to add/remove tags without a code change. Empty value -> no tag filter
+    # (i.e. all Bugs in the project, NOT recommended).
+    tag_filter_raw = os.environ.get(
+        "TRIAGE_TAG_FILTER", "uat-defect,Bug_AlphaUAT1"
+    )
+    tags_to_match = [t.strip() for t in tag_filter_raw.split(",") if t.strip()]
+    # Escape single quotes in tag names to keep the WIQL string injection-safe.
+    tag_clauses = " OR ".join(
+        f"[System.Tags] CONTAINS '{t.replace(chr(39), chr(39) + chr(39))}'"
+        for t in tags_to_match
+    )
+    tag_filter_clause = f"AND ({tag_clauses}) " if tag_clauses else ""
+
     wiql = {
         "query": (
             "SELECT [System.Id] FROM WorkItems "
             f"WHERE [System.TeamProject] = '{PROJECT}' "
             "AND [System.WorkItemType] = 'Bug' "
-            "AND [System.Tags] CONTAINS 'uat-defect' "
+            f"{tag_filter_clause}"
             "ORDER BY [System.CreatedDate] DESC"
         )
     }
+    logging.info("list_uat_defects WIQL tag filter: %s", tags_to_match)
     r = requests.post(
         f"{API}/wiql?api-version=7.1",
         headers={**_headers(), "Content-Type": "application/json"},
