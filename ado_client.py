@@ -283,8 +283,28 @@ def list_uat_defects(force_refresh: bool = False) -> list[dict]:
 
     # Assemble the final list of defects with denormalised relations.
     out: list[dict] = []
+    skipped = 0
     for w in bugs_raw:
-        f = w.get("fields", {})
+        f = w.get("fields") or {}
+        bug_id_raw = f.get("System.Id")
+        if bug_id_raw is None:
+            # Bug missing System.Id field — skip rather than crash the whole page.
+            skipped += 1
+            logging.warning(
+                "list_uat_defects: skipping work item with no System.Id | url=%s | fields=%s",
+                w.get("url"), list(f.keys())[:10],
+            )
+            continue
+        try:
+            bug_id = int(bug_id_raw)
+        except (TypeError, ValueError):
+            skipped += 1
+            logging.warning(
+                "list_uat_defects: skipping work item with bad System.Id %r",
+                bug_id_raw,
+            )
+            continue
+
         tags_raw = (f.get("System.Tags") or "").strip()
         tags = [t.strip() for t in tags_raw.split(";") if t.strip()]
         cluster_tag = next(
@@ -317,21 +337,22 @@ def list_uat_defects(force_refresh: bool = False) -> list[dict]:
                 duplicates.append({"id": rid, "title": info["title"]})
 
         created_by = f.get("System.CreatedBy") or {}
+        if not isinstance(created_by, dict):
+            created_by = {}
+
         out.append(
             {
-                "id": int(f.get("System.Id")),
+                "id": bug_id,
                 "title": f.get("System.Title", "") or "",
                 "state": f.get("System.State", "") or "",
                 "severity": f.get("Microsoft.VSTS.Common.Severity", "") or "",
-                "priority": f.get("Microsoft.VSTS.Common.Priority", 3) or 3,
+                "priority": f.get("Microsoft.VSTS.Common.Priority") or 3,
                 "areaPath": f.get("System.AreaPath", "") or "",
                 "tags": tags,
                 "clusterTag": cluster_tag,
                 "createdDate": f.get("System.CreatedDate", "") or "",
-                "createdBy": (created_by.get("displayName") or "Unknown")
-                if isinstance(created_by, dict) else "Unknown",
-                "createdByEmail": (created_by.get("uniqueName") or "")
-                if isinstance(created_by, dict) else "",
+                "createdBy": created_by.get("displayName") or "Unknown",
+                "createdByEmail": created_by.get("uniqueName") or "",
                 "featureId": feature_id,
                 "featureTitle": feature_title,
                 "relatedBugs": related_bugs,
@@ -342,8 +363,8 @@ def list_uat_defects(force_refresh: bool = False) -> list[dict]:
 
     _defects_cache.update({"ts": now, "data": out})
     logging.info(
-        "list_uat_defects cached %d defects (%d referenced items resolved)",
-        len(out), len(ref_info),
+        "list_uat_defects cached %d defects (%d referenced items resolved, %d skipped)",
+        len(out), len(ref_info), skipped,
     )
     return out
 
