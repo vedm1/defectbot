@@ -170,6 +170,275 @@ def list_features(force_refresh: bool = False) -> list[dict]:
     return out
 
 
+# ----------------------------------------------------------------------------
+# Triage board support
+# ----------------------------------------------------------------------------
+
+_defects_cache: dict = {"ts": 0.0, "data": []}
+DEFECTS_CACHE_TTL = 60  # seconds — short because state changes constantly
+
+
+def _parse_id_from_url(url: str) -> Optional[int]:
+    """Extract the work item ID from a relation URL."""
+    try:
+        return int(url.rsplit("/", 1)[-1])
+    except (ValueError, IndexError):
+        return None
+
+
+def list_uat_defects(force_refresh: bool = False) -> list[dict]:
+    """Fetch all Bugs tagged uat-defect with their relations expanded.
+
+    Returns each as a dict with:
+      id, title, state, severity, priority, areaPath, tags (list), clusterTag,
+      createdDate, createdBy (display name), createdByEmail,
+      featureId (or None), featureTitle (or None),
+      relatedBugs ([{id, title}, ...]),
+      duplicateOf (id or None),
+      duplicates ([{id}, ...]).
+
+    Cached for DEFECTS_CACHE_TTL seconds. Set force_refresh=True after a
+    state-change action to bust the cache.
+    """
+    now = time.time()
+    if not force_refresh and (now - _defects_cache["ts"]) < DEFECTS_CACHE_TTL:
+        return _defects_cache["data"]
+
+    wiql = {
+        "query": (
+            "SELECT [System.Id] FROM WorkItems "
+            f"WHERE [System.TeamProject] = '{PROJECT}' "
+            "AND [System.WorkItemType] = 'Bug' "
+            "AND [System.Tags] CONTAINS 'uat-defect' "
+            "ORDER BY [System.CreatedDate] DESC"
+        )
+    }
+    r = requests.post(
+        f"{API}/wiql?api-version=7.1",
+        headers={**_headers(), "Content-Type": "application/json"},
+        json=wiql,
+        timeout=15,
+    )
+    r.raise_for_status()
+    items = r.json().get("workItems", [])
+    if not items:
+        _defects_cache.update({"ts": now, "data": []})
+        return []
+
+    # Fetch bugs with relations expanded so we see Feature + Related + Duplicate.
+    BATCH = 200
+    bugs_raw: list[dict] = []
+    for start in range(0, len(items), BATCH):
+        chunk = items[start : start + BATCH]
+        ids = ",".join(str(w["id"]) for w in chunk)
+        r = requests.get(
+            f"{API}/workitems?ids={ids}&$expand=relations&api-version=7.1",
+            headers=_headers(),
+            timeout=25,
+        )
+        r.raise_for_status()
+        bugs_raw.extend(r.json().get("value", []))
+
+    # Collect ALL related work-item IDs across all bugs so we can fetch their
+    # types + titles in one (or two) batch GET(s). Otherwise we can't tell
+    # whether a "Related" link points at a Feature or another Bug.
+    referenced_ids: set[int] = set()
+    for w in bugs_raw:
+        for rel in w.get("relations") or []:
+            rtype = rel.get("rel") or ""
+            if rtype in (
+                "System.LinkTypes.Related",
+                "System.LinkTypes.Duplicate-Forward",
+                "System.LinkTypes.Duplicate-Reverse",
+            ):
+                rid = _parse_id_from_url(rel.get("url") or "")
+                if rid:
+                    referenced_ids.add(rid)
+
+    # Look up titles + types for referenced items.
+    ref_info: dict[int, dict] = {}
+    if referenced_ids:
+        ids_list = sorted(referenced_ids)
+        for start in range(0, len(ids_list), BATCH):
+            chunk = ids_list[start : start + BATCH]
+            ids = ",".join(str(i) for i in chunk)
+            r = requests.get(
+                f"{API}/workitems?ids={ids}"
+                "&fields=System.Id,System.Title,System.WorkItemType,System.State"
+                "&api-version=7.1",
+                headers=_headers(),
+                timeout=20,
+            )
+            r.raise_for_status()
+            for w in r.json().get("value", []):
+                f = w.get("fields", {})
+                wid = f.get("System.Id")
+                if wid:
+                    ref_info[int(wid)] = {
+                        "id": int(wid),
+                        "title": f.get("System.Title", "") or "",
+                        "workItemType": f.get("System.WorkItemType", "") or "",
+                        "state": f.get("System.State", "") or "",
+                    }
+
+    # Assemble the final list of defects with denormalised relations.
+    out: list[dict] = []
+    for w in bugs_raw:
+        f = w.get("fields", {})
+        tags_raw = (f.get("System.Tags") or "").strip()
+        tags = [t.strip() for t in tags_raw.split(";") if t.strip()]
+        cluster_tag = next(
+            (t for t in tags if t.lower().startswith("uat-cluster-")), ""
+        )
+
+        feature_id: Optional[int] = None
+        feature_title = ""
+        related_bugs: list[dict] = []
+        duplicate_of: Optional[int] = None
+        duplicates: list[dict] = []
+
+        for rel in (w.get("relations") or []):
+            rtype = rel.get("rel") or ""
+            rid = _parse_id_from_url(rel.get("url") or "")
+            if not rid or rid not in ref_info:
+                continue
+            info = ref_info[rid]
+            if rtype == "System.LinkTypes.Related":
+                if info["workItemType"] == "Feature":
+                    feature_id = rid
+                    feature_title = info["title"]
+                elif info["workItemType"] == "Bug":
+                    related_bugs.append({"id": rid, "title": info["title"], "state": info["state"]})
+            elif rtype == "System.LinkTypes.Duplicate-Forward":
+                # This bug is a duplicate of `rid`.
+                duplicate_of = rid
+            elif rtype == "System.LinkTypes.Duplicate-Reverse":
+                # `rid` is a duplicate of this bug.
+                duplicates.append({"id": rid, "title": info["title"]})
+
+        created_by = f.get("System.CreatedBy") or {}
+        out.append(
+            {
+                "id": int(f.get("System.Id")),
+                "title": f.get("System.Title", "") or "",
+                "state": f.get("System.State", "") or "",
+                "severity": f.get("Microsoft.VSTS.Common.Severity", "") or "",
+                "priority": f.get("Microsoft.VSTS.Common.Priority", 3) or 3,
+                "areaPath": f.get("System.AreaPath", "") or "",
+                "tags": tags,
+                "clusterTag": cluster_tag,
+                "createdDate": f.get("System.CreatedDate", "") or "",
+                "createdBy": (created_by.get("displayName") or "Unknown")
+                if isinstance(created_by, dict) else "Unknown",
+                "createdByEmail": (created_by.get("uniqueName") or "")
+                if isinstance(created_by, dict) else "",
+                "featureId": feature_id,
+                "featureTitle": feature_title,
+                "relatedBugs": related_bugs,
+                "duplicateOf": duplicate_of,
+                "duplicates": duplicates,
+            }
+        )
+
+    _defects_cache.update({"ts": now, "data": out})
+    logging.info(
+        "list_uat_defects cached %d defects (%d referenced items resolved)",
+        len(out), len(ref_info),
+    )
+    return out
+
+
+def bulk_update_state(bug_ids: list[int], new_state: str) -> list[dict]:
+    """Set System.State on a list of Bug work items.
+
+    Returns one dict per bug with {id, ok, error}. The cache is invalidated
+    after at least one successful update.
+    """
+    results: list[dict] = []
+    patch = [{"op": "add", "path": "/fields/System.State", "value": new_state}]
+    headers = {**_headers(), "Content-Type": "application/json-patch+json"}
+    any_ok = False
+    for bug_id in bug_ids:
+        try:
+            r = requests.patch(
+                f"{API}/workitems/{int(bug_id)}?api-version=7.1",
+                headers=headers, json=patch, timeout=15,
+            )
+            if r.ok:
+                results.append({"id": bug_id, "ok": True, "error": ""})
+                any_ok = True
+            else:
+                results.append(
+                    {"id": bug_id, "ok": False, "error": f"{r.status_code} {r.text[:200]}"}
+                )
+                logging.warning(
+                    "bulk_update_state failed | bug=%s | status=%s | body=%s",
+                    bug_id, r.status_code, r.text[:200],
+                )
+        except Exception as e:
+            results.append({"id": bug_id, "ok": False, "error": str(e)[:200]})
+            logging.exception("bulk_update_state exception | bug=%s", bug_id)
+    if any_ok:
+        _defects_cache["ts"] = 0.0  # bust cache
+    return results
+
+
+def mark_as_duplicates(
+    canonical_id: int, duplicate_ids: list[int], close_state: str = "Done"
+) -> list[dict]:
+    """For each ID in duplicate_ids, add a Duplicate-Forward link pointing to
+    canonical_id and (optionally) move the bug to close_state in one PATCH.
+
+    Returns one dict per duplicate with {id, ok, error}.
+    """
+    results: list[dict] = []
+    headers = {**_headers(), "Content-Type": "application/json-patch+json"}
+    any_ok = False
+    for dup_id in duplicate_ids:
+        if int(dup_id) == int(canonical_id):
+            results.append({"id": dup_id, "ok": False, "error": "Cannot mark canonical as duplicate of itself"})
+            continue
+        patch = [
+            {
+                "op": "add",
+                "path": "/relations/-",
+                "value": {
+                    "rel": "System.LinkTypes.Duplicate-Forward",
+                    "url": f"{ORG_API}/workItems/{int(canonical_id)}",
+                    "attributes": {
+                        "comment": f"Marked as duplicate of #{int(canonical_id)} via triage UI."
+                    },
+                },
+            }
+        ]
+        if close_state:
+            patch.append(
+                {"op": "add", "path": "/fields/System.State", "value": close_state}
+            )
+        try:
+            r = requests.patch(
+                f"{API}/workitems/{int(dup_id)}?api-version=7.1",
+                headers=headers, json=patch, timeout=15,
+            )
+            if r.ok:
+                results.append({"id": dup_id, "ok": True, "error": ""})
+                any_ok = True
+            else:
+                results.append(
+                    {"id": dup_id, "ok": False, "error": f"{r.status_code} {r.text[:200]}"}
+                )
+                logging.warning(
+                    "mark_as_duplicates failed | dup=%s | canonical=%s | status=%s | body=%s",
+                    dup_id, canonical_id, r.status_code, r.text[:200],
+                )
+        except Exception as e:
+            results.append({"id": dup_id, "ok": False, "error": str(e)[:200]})
+            logging.exception("mark_as_duplicates exception | dup=%s", dup_id)
+    if any_ok:
+        _defects_cache["ts"] = 0.0  # bust cache
+    return results
+
+
 def upload_attachment(file_name: str, content: bytes) -> str:
     """Upload binary content to ADO's attachments endpoint.
 

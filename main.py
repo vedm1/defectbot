@@ -49,6 +49,7 @@ def _load_form_tags() -> list[str]:
 from ado_client import health_check as ado_health, list_features
 from claude_client import triage_defect
 from teams_client import post_to_channel
+from triage import router as triage_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("defect-agent")
@@ -58,6 +59,7 @@ app = FastAPI(
     description="Teams Outgoing Webhook -> Claude triage -> ADO Bug under Epic #375255",
     version="0.1.0",
 )
+app.include_router(triage_router)
 
 
 # ----------------------------------------------------------------------------
