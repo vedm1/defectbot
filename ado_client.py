@@ -232,7 +232,10 @@ def list_uat_defects(force_refresh: bool = False) -> list[dict]:
         chunk = items[start : start + BATCH]
         ids = ",".join(str(w["id"]) for w in chunk)
         r = requests.get(
-            f"{API}/workitems?ids={ids}&$expand=relations&api-version=7.1",
+            # $expand=all returns BOTH all fields AND relations. The narrower
+            # $expand=relations returns only ~10 system fields and drops
+            # System.Id / System.Title / Severity / etc.
+            f"{API}/workitems?ids={ids}&$expand=all&api-version=7.1",
             headers=_headers(),
             timeout=25,
         )
@@ -286,12 +289,13 @@ def list_uat_defects(force_refresh: bool = False) -> list[dict]:
     skipped = 0
     for w in bugs_raw:
         f = w.get("fields") or {}
-        bug_id_raw = f.get("System.Id")
+        # Prefer System.Id from fields; fall back to the top-level `id`
+        # (which ADO always includes regardless of $expand mode).
+        bug_id_raw = f.get("System.Id") if f.get("System.Id") is not None else w.get("id")
         if bug_id_raw is None:
-            # Bug missing System.Id field — skip rather than crash the whole page.
             skipped += 1
             logging.warning(
-                "list_uat_defects: skipping work item with no System.Id | url=%s | fields=%s",
+                "list_uat_defects: skipping work item with no id | url=%s | fields=%s",
                 w.get("url"), list(f.keys())[:10],
             )
             continue
@@ -300,8 +304,7 @@ def list_uat_defects(force_refresh: bool = False) -> list[dict]:
         except (TypeError, ValueError):
             skipped += 1
             logging.warning(
-                "list_uat_defects: skipping work item with bad System.Id %r",
-                bug_id_raw,
+                "list_uat_defects: skipping work item with bad id %r", bug_id_raw,
             )
             continue
 
