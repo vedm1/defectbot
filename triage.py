@@ -26,11 +26,35 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+import re
+
 from ado_client import (
+    bulk_assign,
     bulk_update_state,
     list_uat_defects,
     mark_as_duplicates,
 )
+
+
+def _load_assignable_users() -> list[dict]:
+    """Parse ASSIGNABLE_USERS env var (Name <email>,Name <email>,...) -> list of dicts.
+
+    Examples accepted per entry:
+      Ved Muthal <ved@euromonitor.com>     -> {"name":"Ved Muthal","email":"ved@..."}
+      ved@euromonitor.com                  -> {"name":"ved@...", "email":"ved@..."}
+    """
+    raw = os.environ.get("ASSIGNABLE_USERS", "")
+    users: list[dict] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        m = re.match(r"^(.+?)\s*<([^>]+)>$", entry)
+        if m:
+            users.append({"name": m.group(1).strip(), "email": m.group(2).strip()})
+        elif "@" in entry:
+            users.append({"name": entry, "email": entry})
+    return users
 
 log = logging.getLogger("defect-agent.triage")
 
@@ -323,12 +347,61 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 .banner { background: #ecfdf3; border: 1px solid #b2efc2; color: #15532b;
        padding: 12px 24px; font-size: 13px; }
 .banner.err { background: #fef2f2; border-color: #fecaca; color: #7b1d1d; }
+.card { cursor: pointer; }
+.card.dragging { opacity: 0.45; transform: rotate(1.5deg); cursor: grabbing; }
+.card-select, .card .bug-id, .card footer .state-form, .card .related summary,
+.card .meta a { cursor: pointer; }
+.cards.drag-over { background: #e9edfa; border: 2px dashed #6264a7;
+       border-radius: 8px; min-height: 80px; }
+.modal-wide { max-width: 720px; }
+.modal-header { display: flex; align-items: flex-start; gap: 14px;
+       margin-bottom: 14px; }
+.modal-header h2 { flex: 1; margin: 0; font-size: 16px; line-height: 1.35; }
+.modal-close { background: transparent; border: 0; font-size: 22px; cursor: pointer;
+       color: #999; padding: 0 4px; line-height: 1; }
+.modal-meta { display: flex; flex-wrap: wrap; gap: 8px; font-size: 12px;
+       color: #555; margin-bottom: 14px; padding-bottom: 12px;
+       border-bottom: 1px solid #eee; }
+.modal-meta > span { display: inline-flex; align-items: center; gap: 4px; }
+.modal-meta a { color: #6264a7; text-decoration: none; }
+.modal-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 14px; }
+.modal-tags .tag { padding: 2px 8px; background: #f3f4f6; color: #555;
+       border-radius: 10px; font-size: 11px; font-family: monospace; }
+.modal h3 { margin: 14px 0 8px; font-size: 13px; font-weight: 600;
+       color: #555; text-transform: uppercase; letter-spacing: .04em; }
+.modal-repro { background: #fafafa; padding: 12px 16px; border-radius: 6px;
+       max-height: 320px; overflow-y: auto; font-size: 13px; line-height: 1.5; }
+.modal-repro div { margin: 0; }
+.modal-relations ul { margin: 0; padding-left: 18px; font-size: 13px;
+       line-height: 1.7; }
+.modal-relations a { color: #6264a7; text-decoration: none; }
+.modal-actions { display: flex; gap: 8px; margin-top: 18px;
+       padding-top: 14px; border-top: 1px solid #eee; }
+.modal-actions .grow { flex: 1; }
+.modal-actions select { padding: 7px 10px; font-size: 13px;
+       border: 1px solid #d4d4d8; border-radius: 6px; }
 """
 
 _BOARD_JS = r"""
 (function() {
   const board = document.querySelector('.board');
   const cards = Array.from(document.querySelectorAll('.card'));
+  const detailModal = document.getElementById('detail-modal');
+  const detailClose = document.getElementById('detail-close');
+  const detailTitle = document.getElementById('detail-title');
+  const detailMeta = document.getElementById('detail-meta');
+  const detailTags = document.getElementById('detail-tags');
+  const detailRepro = document.getElementById('detail-repro');
+  const detailRelated = document.getElementById('detail-related');
+  const detailStateSel = document.getElementById('detail-state-change');
+  const detailApply = document.getElementById('detail-apply-state');
+  const detailAdo = document.getElementById('detail-ado-link');
+  const assignModal = document.getElementById('assign-modal');
+  const assignCount = document.getElementById('assign-count');
+  const assignCancel = document.getElementById('assign-cancel');
+  const assignConfirm = document.getElementById('assign-confirm');
+  const assignUser = document.getElementById('assign-user');
+  const bulkAssignBtn = document.getElementById('bulk-assign');
   const search = document.getElementById('search');
   const sevChips = document.querySelectorAll('.sev-chip');
   const featureFilter = document.getElementById('feature-filter');
@@ -513,7 +586,6 @@ _BOARD_JS = r"""
         const card = e.target.closest('.card');
         if (e.target.checked) selected.add(id); else selected.delete(id);
         card.classList.toggle('selected', e.target.checked);
-        // sync state across all instances of this card (cluster view duplicates DOM)
         document.querySelectorAll('.card[data-bug-id="' + id + '"]').forEach(c => {
           c.classList.toggle('selected', e.target.checked);
           const x = c.querySelector('.card-select');
@@ -523,6 +595,166 @@ _BOARD_JS = r"""
       };
     });
   }
+
+  // ----- drag and drop -----
+  function bindDragDrop() {
+    document.querySelectorAll('.card').forEach(card => {
+      card.setAttribute('draggable', 'true');
+      card.addEventListener('dragstart', function(e) {
+        e.dataTransfer.setData('text/plain', card.dataset.bugId);
+        e.dataTransfer.effectAllowed = 'move';
+        card.classList.add('dragging');
+      });
+      card.addEventListener('dragend', function() {
+        card.classList.remove('dragging');
+        document.querySelectorAll('.cards.drag-over').forEach(z => z.classList.remove('drag-over'));
+      });
+    });
+    document.querySelectorAll('.column .cards').forEach(zone => {
+      zone.addEventListener('dragover', function(e) {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+        zone.classList.add('drag-over');
+      });
+      zone.addEventListener('dragleave', function(e) {
+        if (!zone.contains(e.relatedTarget)) zone.classList.remove('drag-over');
+      });
+      zone.addEventListener('drop', function(e) {
+        e.preventDefault();
+        zone.classList.remove('drag-over');
+        const bugId = e.dataTransfer.getData('text/plain');
+        const col = zone.closest('.column');
+        const newState = col.dataset.state;
+        if (!bugId || !newState) return;
+        const card = document.querySelector('.card[data-bug-id="' + bugId + '"]');
+        const currentState = card && card.dataset.state;
+        if (currentState === newState) return;  // no-op
+        submitForm('/triage/bulk-state', { bug_ids: [bugId], new_state: newState });
+      });
+    });
+  }
+
+  function submitForm(action, fields) {
+    const form = document.createElement('form');
+    form.method = 'post';
+    form.action = action;
+    Object.keys(fields).forEach(k => {
+      const vals = Array.isArray(fields[k]) ? fields[k] : [fields[k]];
+      vals.forEach(v => {
+        const i = document.createElement('input');
+        i.type = 'hidden'; i.name = k; i.value = v;
+        form.appendChild(i);
+      });
+    });
+    document.body.appendChild(form);
+    form.submit();
+  }
+
+  // ----- detail modal -----
+  function openDetail(bugId) {
+    const data = (window.BUG_DATA || {})[bugId];
+    if (!data) return;
+    detailTitle.textContent = '#' + data.id + ' — ' + data.title;
+    detailMeta.innerHTML = '';
+    function chip(label, value, href) {
+      if (!value) return;
+      const s = document.createElement('span');
+      if (href) {
+        const a = document.createElement('a');
+        a.href = href; a.target = '_blank'; a.textContent = value;
+        s.innerHTML = '<strong>' + label + ':</strong>&nbsp;';
+        s.appendChild(a);
+      } else {
+        s.innerHTML = '<strong>' + label + ':</strong>&nbsp;' + value;
+      }
+      detailMeta.appendChild(s);
+    }
+    chip('State', data.state);
+    chip('Severity', data.severity);
+    chip('Assignee', data.assignedTo || 'Unassigned');
+    chip('Reporter', data.createdBy);
+    if (data.featureId) {
+      chip('Feature', '#' + data.featureId + ' ' + (data.featureTitle || ''),
+           'https://dev.azure.com/euromonitor/North%20Star/_workitems/edit/' + data.featureId);
+    }
+    detailTags.innerHTML = '';
+    (data.tags || []).forEach(t => {
+      const s = document.createElement('span');
+      s.className = 'tag';
+      s.textContent = t;
+      detailTags.appendChild(s);
+    });
+    detailRepro.innerHTML = data.reproSteps || '<em>(no repro steps)</em>';
+    detailRelated.innerHTML = '';
+    if ((data.relatedBugs || []).length === 0 && !data.duplicateOf && (data.duplicates || []).length === 0) {
+      const li = document.createElement('li');
+      li.innerHTML = '<em>No related, duplicate, or duplicate-of links.</em>';
+      detailRelated.appendChild(li);
+    } else {
+      if (data.duplicateOf) {
+        const li = document.createElement('li');
+        li.innerHTML = 'Duplicate of <a target="_blank" href="https://dev.azure.com/euromonitor/North%20Star/_workitems/edit/' + data.duplicateOf + '">#' + data.duplicateOf + '</a>';
+        detailRelated.appendChild(li);
+      }
+      (data.relatedBugs || []).forEach(r => {
+        const li = document.createElement('li');
+        li.innerHTML = 'Related: <a target="_blank" href="https://dev.azure.com/euromonitor/North%20Star/_workitems/edit/' + r.id + '">#' + r.id + ' — ' + (r.title || '') + '</a> <em>(' + (r.state || '') + ')</em>';
+        detailRelated.appendChild(li);
+      });
+      (data.duplicates || []).forEach(r => {
+        const li = document.createElement('li');
+        li.innerHTML = 'Has duplicate: <a target="_blank" href="https://dev.azure.com/euromonitor/North%20Star/_workitems/edit/' + r.id + '">#' + r.id + ' — ' + (r.title || '') + '</a>';
+        detailRelated.appendChild(li);
+      });
+    }
+    // State dropdown
+    detailStateSel.value = data.state;
+    detailAdo.href = 'https://dev.azure.com/euromonitor/North%20Star/_workitems/edit/' + data.id;
+    detailModal.dataset.bugId = data.id;
+    detailModal.classList.add('visible');
+  }
+
+  cards.forEach(card => {
+    card.addEventListener('click', function(e) {
+      // Ignore clicks on the checkbox, the state dropdown, links, and the related-expand summary
+      if (e.target.closest('.card-select, .state-form, a, .related summary, input, select, button')) return;
+      openDetail(card.dataset.bugId);
+    });
+  });
+
+  detailClose.addEventListener('click', () => detailModal.classList.remove('visible'));
+  detailModal.addEventListener('click', e => {
+    if (e.target === detailModal) detailModal.classList.remove('visible');
+  });
+  detailApply.addEventListener('click', function() {
+    const id = detailModal.dataset.bugId;
+    const ns = detailStateSel.value;
+    if (!id || !ns) return;
+    if (!confirm('Move #' + id + ' to "' + ns + '"?')) return;
+    submitForm('/triage/bulk-state', { bug_ids: [id], new_state: ns });
+  });
+
+  // ----- bulk assign -----
+  if (bulkAssignBtn) {
+    bulkAssignBtn.addEventListener('click', function() {
+      if (selected.size === 0) return;
+      assignCount.textContent = selected.size;
+      assignModal.classList.add('visible');
+    });
+    assignCancel.addEventListener('click', () => assignModal.classList.remove('visible'));
+    assignModal.addEventListener('click', e => {
+      if (e.target === assignModal) assignModal.classList.remove('visible');
+    });
+    assignConfirm.addEventListener('click', function() {
+      const email = assignUser.value;
+      if (!email) return;
+      const ids = Array.from(selected);
+      if (!confirm('Assign ' + ids.length + ' bug(s) to ' + email + '?')) return;
+      submitForm('/triage/bulk-assign', { bug_ids: ids, assignee_email: email });
+    });
+  }
+
+  bindDragDrop();
 })();
 """
 
@@ -542,6 +774,40 @@ def _render_board_html(defects: list[dict], banner: str = "") -> str:
     state_opts = "".join(f'<option value="{_esc(s)}">{_esc(s)}</option>' for s in STATE_OPTIONS)
     columns_html = _render_columns(defects)
     banner_html = banner if banner else ""
+
+    # Embed all bug data as a JSON object so the detail modal can render
+    # full repro steps + related/duplicate links without server round-trips.
+    bug_data_map: dict[int, dict] = {b["id"]: b for b in defects}
+    bug_data_json = json.dumps(bug_data_map)
+
+    # Assignable users for the Assign bulk action.
+    users = _load_assignable_users()
+    assign_options = "".join(
+        f'<option value="{_esc(u["email"])}">{_esc(u["name"])}</option>'
+        for u in users
+    )
+    assign_btn_html = (
+        '<button id="bulk-assign">Assign to...</button>' if users else ""
+    )
+    assign_modal_html = ""
+    if users:
+        assign_modal_html = f"""
+<div class="modal-bg" id="assign-modal">
+  <div class="modal">
+    <h2>Assign bugs</h2>
+    <p><span id="assign-count">0</span> bug(s) selected.</p>
+    <label>Assign to
+      <select id="assign-user">
+        <option value="">-- Pick a person --</option>
+        {assign_options}
+      </select>
+    </label>
+    <div class="actions">
+      <button id="assign-cancel" class="secondary">Cancel</button>
+      <button id="assign-confirm" class="primary">Assign</button>
+    </div>
+  </div>
+</div>"""
 
     return f"""<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -579,6 +845,7 @@ def _render_board_html(defects: list[dict], banner: str = "") -> str:
   </select>
   <button id="bulk-apply" class="primary">Apply state change</button>
   <button id="bulk-dup">Mark as duplicate of...</button>
+  {assign_btn_html}
   <button id="bulk-clear" class="danger">Clear</button>
 </div>
 
@@ -602,6 +869,33 @@ def _render_board_html(defects: list[dict], banner: str = "") -> str:
   </div>
 </div>
 
+{assign_modal_html}
+
+<div class="modal-bg" id="detail-modal">
+  <div class="modal modal-wide">
+    <div class="modal-header">
+      <h2 id="detail-title">—</h2>
+      <button class="modal-close" id="detail-close" aria-label="Close">×</button>
+    </div>
+    <div class="modal-meta" id="detail-meta"></div>
+    <div class="modal-tags" id="detail-tags"></div>
+    <h3>Steps to reproduce</h3>
+    <div class="modal-repro" id="detail-repro">—</div>
+    <h3>Relations</h3>
+    <div class="modal-relations"><ul id="detail-related"></ul></div>
+    <div class="modal-actions">
+      <select id="detail-state-change">{state_opts}</select>
+      <button id="detail-apply-state" class="primary">Change state</button>
+      <div class="grow"></div>
+      <a id="detail-ado-link" target="_blank" href="#" class="secondary"
+         style="text-decoration:none;padding:9px 18px;background:#f3f3f6;color:#333;border-radius:6px;font-weight:600;font-size:13px;">
+        Open in ADO ↗
+      </a>
+    </div>
+  </div>
+</div>
+
+<script>window.BUG_DATA = {bug_data_json};</script>
 <script>{_BOARD_JS}</script>
 </body></html>"""
 
@@ -647,6 +941,35 @@ async def triage_bulk_state(
     log.info(
         "Triage bulk-state result | ok=%d | failed=%d | failures=%s",
         ok, len(failed), [f"#{r['id']}: {r['error'][:80]}" for r in failed][:5],
+    )
+    return RedirectResponse(url="/triage", status_code=303)
+
+
+@router.post("/bulk-assign", response_class=HTMLResponse)
+async def triage_bulk_assign(
+    bug_ids: list[str] = Form(default_factory=list),
+    assignee_email: str = Form(...),
+) -> HTMLResponse:
+    # Validate the assignee is in the configured allow-list.
+    allowed_emails = {u["email"] for u in _load_assignable_users()}
+    if assignee_email not in allowed_emails:
+        log.warning("Rejected unknown assignee: %s", assignee_email)
+        return RedirectResponse(url="/triage", status_code=303)
+
+    ids: list[int] = []
+    for b in bug_ids:
+        try:
+            ids.append(int(b))
+        except (TypeError, ValueError):
+            continue
+    if not ids:
+        return RedirectResponse(url="/triage", status_code=303)
+
+    log.info("Triage bulk-assign | bugs=%s | assignee=%s", ids, assignee_email)
+    results = bulk_assign(ids, assignee_email)
+    ok = sum(1 for r in results if r["ok"])
+    log.info(
+        "Triage bulk-assign result | ok=%d | failed=%d", ok, len(results) - ok,
     )
     return RedirectResponse(url="/triage", status_code=303)
 

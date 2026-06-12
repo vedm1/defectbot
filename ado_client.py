@@ -342,6 +342,9 @@ def list_uat_defects(force_refresh: bool = False) -> list[dict]:
         created_by = f.get("System.CreatedBy") or {}
         if not isinstance(created_by, dict):
             created_by = {}
+        assigned_to = f.get("System.AssignedTo") or {}
+        if not isinstance(assigned_to, dict):
+            assigned_to = {}
 
         out.append(
             {
@@ -356,6 +359,9 @@ def list_uat_defects(force_refresh: bool = False) -> list[dict]:
                 "createdDate": f.get("System.CreatedDate", "") or "",
                 "createdBy": created_by.get("displayName") or "Unknown",
                 "createdByEmail": created_by.get("uniqueName") or "",
+                "assignedTo": assigned_to.get("displayName") or "",
+                "assignedToEmail": assigned_to.get("uniqueName") or "",
+                "reproSteps": f.get("Microsoft.VSTS.TCM.ReproSteps", "") or "",
                 "featureId": feature_id,
                 "featureTitle": feature_title,
                 "relatedBugs": related_bugs,
@@ -402,6 +408,50 @@ def bulk_update_state(bug_ids: list[int], new_state: str) -> list[dict]:
         except Exception as e:
             results.append({"id": bug_id, "ok": False, "error": str(e)[:200]})
             logging.exception("bulk_update_state exception | bug=%s", bug_id)
+    if any_ok:
+        _defects_cache["ts"] = 0.0  # bust cache
+    return results
+
+
+def bulk_assign(bug_ids: list[int], assignee_email: str) -> list[dict]:
+    """Set System.AssignedTo on a list of Bug work items.
+
+    `assignee_email` should be the UPN / email address of the target user.
+    ADO resolves this to a person record. Pass empty string to unassign.
+
+    Returns one dict per bug with {id, ok, error}.
+    """
+    results: list[dict] = []
+    patch = [
+        {
+            "op": "add",
+            "path": "/fields/System.AssignedTo",
+            "value": assignee_email or "",
+        }
+    ]
+    headers = {**_headers(), "Content-Type": "application/json-patch+json"}
+    any_ok = False
+    for bug_id in bug_ids:
+        try:
+            r = requests.patch(
+                f"{API}/workitems/{int(bug_id)}?api-version=7.1",
+                headers=headers, json=patch, timeout=15,
+            )
+            if r.ok:
+                results.append({"id": bug_id, "ok": True, "error": ""})
+                any_ok = True
+            else:
+                results.append(
+                    {"id": bug_id, "ok": False,
+                     "error": f"{r.status_code} {r.text[:200]}"}
+                )
+                logging.warning(
+                    "bulk_assign failed | bug=%s | assignee=%s | status=%s",
+                    bug_id, assignee_email, r.status_code,
+                )
+        except Exception as e:
+            results.append({"id": bug_id, "ok": False, "error": str(e)[:200]})
+            logging.exception("bulk_assign exception | bug=%s", bug_id)
     if any_ok:
         _defects_cache["ts"] = 0.0  # bust cache
     return results
